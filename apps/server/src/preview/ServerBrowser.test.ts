@@ -51,8 +51,11 @@ vi.mock("./ServerBrowserContexts.ts", () => ({
     }
     async connectDesktopPage(endpoint: string) {
       const context = makeContext();
-      desktopConnections.push({ endpoint, context });
-      return { browser: { close: async () => {} }, page: context.page as unknown as Page };
+      const close = vi.fn(async () => desktopConnectionClosed?.resolve());
+      desktopConnections.push({ endpoint, context, close });
+      desktopConnectionStarted?.resolve();
+      await desktopConnectionGate?.promise;
+      return { browser: { close }, page: context.page as unknown as Page };
     }
     async close() {
       for (const context of contexts) await context.close();
@@ -158,6 +161,10 @@ let clipboardBinding: ClipboardBinding | null = null;
 let contextFailure: Error | null = null;
 /** Server tabs the fake desktop renders, and the endpoints the server connected to. */
 let desktopRendersNext = false;
+let desktopAvailable = false;
+let desktopConnectionGate: PromiseWithResolvers<void> | null = null;
+let desktopConnectionStarted: PromiseWithResolvers<void> | null = null;
+let desktopConnectionClosed: PromiseWithResolvers<void> | null = null;
 /** Pages the fake desktop takes back or returns; the channel's streams emit them. */
 const desktopDetaches = new NodeEvents.EventEmitter();
 const desktopTabs = new Set<string>();
@@ -169,7 +176,11 @@ const desktopRenders = (tabId: string) => {
   return desktopTabs.has(tabId);
 };
 const releasedDesktopTabs: Array<string> = [];
-const desktopConnections: Array<{ endpoint: string; context: ReturnType<typeof makeContext> }> = [];
+const desktopConnections: Array<{
+  endpoint: string;
+  context: ReturnType<typeof makeContext>;
+  close: ReturnType<typeof vi.fn>;
+}> = [];
 const testThread = {
   threadId: ThreadId.make("browser-test-thread"),
   providerSessionId: "agent-a",
@@ -200,8 +211,10 @@ const dependencies = Layer.mergeAll(
     installed: Effect.die("mock Chromium does not need an executable"),
   }),
   Layer.succeed(DesktopChannel.DesktopBrowserChannel, {
-    // Only tabs a test marks render on the desktop; the rest stay headless.
-    available: true,
+    // Standalone tests have no desktop; native tests explicitly enable it.
+    get available() {
+      return desktopAvailable || desktopRendersNext || desktopTabs.size > 0;
+    },
     awaitAttached: (key) => Effect.sync(() => desktopRenders(key.tabId)),
     detached: Stream.callback<{ threadId: string; tabId: string }>((queue) =>
       Effect.acquireRelease(
@@ -274,6 +287,10 @@ beforeEach(() => {
   contextFailure = null;
   desktopTabs.clear();
   desktopRendersNext = false;
+  desktopAvailable = false;
+  desktopConnectionGate = null;
+  desktopConnectionStarted = null;
+  desktopConnectionClosed = null;
   releasedDesktopTabs.length = 0;
   desktopConnections.length = 0;
 });
@@ -1306,6 +1323,184 @@ it.live("viewers see the agent's pointer move to its target and click there", ()
         expect.objectContaining({ phase: "click", x: 140, y: 50 }),
       ]);
       expect(click).toHaveBeenCalledOnce();
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live("a late native attachment retries the same tab without opening headless", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* Broker.PreviewAutomationBroker;
+      const manager = yield* Manager.PreviewManager;
+      yield* Effect.yieldNow;
+      desktopAvailable = true;
+      const failure = yield* broker
+        .invoke<PreviewAutomationStatus>({
+          scope,
+          operation: "open",
+          input: { reuseExistingTab: false, show: false },
+        })
+        .pipe(Effect.flip);
+      expect(failure).toMatchObject({
+        _tag: "PreviewAutomationExecutionError",
+        message: expect.stringContaining("in-app browser tab has not attached"),
+      });
+      const { sessions } = yield* manager.list({ threadId: scope.thread.threadId });
+      expect(sessions).toHaveLength(1);
+      const pending = yield* broker.invoke<PreviewAutomationStatus>({
+        scope,
+        operation: "status",
+        input: {},
+      });
+      const tabId = PreviewTabId.make(sessions[0]!.tabId);
+      expect(pending).toMatchObject({ available: false, tabId });
+      expect(pending.tabs).toEqual([
+        expect.objectContaining({ tabId, owner: "agent", ownedByCaller: true }),
+      ]);
+      expect(contexts).toEqual([]);
+      expect(contextRequests).toEqual([]);
+      for (const operation of ["open", "evaluate"] as const) {
+        expect(
+          yield* broker
+            .invoke({
+              scope,
+              tabId,
+              operation,
+              input: operation === "open" ? { reuseExistingTab: true } : { expression: "42" },
+            })
+            .pipe(Effect.flip),
+        ).toMatchObject({
+          _tag: "PreviewAutomationExecutionError",
+          message: expect.stringContaining("in-app browser tab has not attached"),
+        });
+      }
+      expect((yield* manager.list({ threadId: scope.thread.threadId })).sessions).toHaveLength(1);
+      expect(contexts).toEqual([]);
+      desktopTabs.add(tabId);
+      desktopDetaches.emit("attach", { threadId: scope.thread.threadId, tabId });
+      const retried = yield* broker.invoke<PreviewAutomationStatus>({
+        scope,
+        tabId,
+        operation: "open",
+        input: { reuseExistingTab: true, show: false },
+      });
+      expect(retried).toMatchObject({ available: true, tabId });
+      expect(desktopConnections).toHaveLength(1);
+      expect(contexts).toEqual([]);
+      expect((yield* manager.list({ threadId: scope.thread.threadId })).sessions).toHaveLength(1);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live("only the owning agent can close a native tab that has not attached", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* Broker.PreviewAutomationBroker;
+      const manager = yield* Manager.PreviewManager;
+      yield* Effect.yieldNow;
+      desktopAvailable = true;
+      yield* broker
+        .invoke<PreviewAutomationStatus>({
+          scope,
+          operation: "open",
+          input: { reuseExistingTab: false, show: false },
+        })
+        .pipe(Effect.flip);
+      const { sessions } = yield* manager.list({ threadId: scope.thread.threadId });
+      const tabId = PreviewTabId.make(sessions[0]!.tabId);
+      expect(
+        yield* broker
+          .invoke<void>({
+            scope: asSession("another-agent"),
+            tabId,
+            operation: "close",
+            input: {},
+          })
+          .pipe(Effect.flip),
+      ).toMatchObject({
+        _tag: "PreviewAutomationControlInterruptedError",
+        reason: "agentMismatch",
+      });
+      // Status makes the pending tab current, so the owner can close without an explicit ID.
+      yield* broker.invoke({ scope, operation: "status", input: {} });
+      yield* broker.invoke({ scope, operation: "close", input: {} });
+      expect((yield* manager.list({ threadId: scope.thread.threadId })).sessions).toEqual([]);
+      expect(contexts).toEqual([]);
+      const queried = Promise.withResolvers<void>();
+      const list = manager.list;
+      vi.spyOn(manager, "list").mockImplementation((input) =>
+        list(input).pipe(Effect.tap(() => Effect.sync(() => queried.resolve()))),
+      );
+      desktopTabs.add(tabId);
+      desktopDetaches.emit("attach", { threadId: scope.thread.threadId, tabId });
+      yield* Effect.promise(() => queried.promise);
+      expect(desktopConnections).toEqual([]);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live("closing a pending native session cancels its connection already in flight", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* Broker.PreviewAutomationBroker;
+      const manager = yield* Manager.PreviewManager;
+      yield* Effect.yieldNow;
+      desktopAvailable = true;
+      yield* broker
+        .invoke({ scope, operation: "open", input: { reuseExistingTab: false, show: false } })
+        .pipe(Effect.flip);
+      const { sessions } = yield* manager.list({ threadId: scope.thread.threadId });
+      const tabId = PreviewTabId.make(sessions[0]!.tabId);
+      const connecting = Promise.withResolvers<void>();
+      const connected = Promise.withResolvers<void>();
+      const disconnected = Promise.withResolvers<void>();
+      desktopConnectionStarted = connecting;
+      desktopConnectionGate = connected;
+      desktopConnectionClosed = disconnected;
+      desktopTabs.add(tabId);
+      desktopDetaches.emit("attach", { threadId: scope.thread.threadId, tabId });
+      yield* Effect.promise(() => connecting.promise);
+      const closingStarted = Promise.withResolvers<void>();
+      const closeCommitted = Promise.withResolvers<void>();
+      const close = manager.close;
+      vi.spyOn(manager, "close").mockImplementationOnce((input) =>
+        Effect.promise(async () => {
+          closingStarted.resolve();
+          await closeCommitted.promise;
+        }).pipe(Effect.andThen(close(input))),
+      );
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          connected.resolve();
+          closeCommitted.resolve();
+        }),
+      );
+      const closing = yield* broker
+        .invoke({ scope, tabId, operation: "close", input: {} })
+        .pipe(Effect.forkScoped);
+      yield* Effect.promise(() => closingStarted.promise);
+      connected.resolve();
+      // The page connection tears down before the manager close can publish.
+      yield* Effect.promise(() => disconnected.promise);
+      expect(desktopConnections[0]!.close).toHaveBeenCalledOnce();
+      closeCommitted.resolve();
+      yield* Fiber.join(closing);
+      expect((yield* manager.list({ threadId: scope.thread.threadId })).sessions).toEqual([]);
+      expect(contexts).toEqual([]);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live("a standalone server still opens a headless page when no desktop channel exists", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { broker, tabId } = yield* ready;
+      expect(desktopAvailable).toBe(false);
+      expect(contexts).toHaveLength(1);
+      expect(desktopConnections).toEqual([]);
+      expect(
+        yield* broker.invoke({ scope, tabId, operation: "evaluate", input: { expression: "42" } }),
+      ).toBe("evaluated");
     }),
   ).pipe(Effect.provide(layer)),
 );

@@ -92,7 +92,7 @@ const SCREENCAST_MOTION_FRAMES = 4;
 const SCREENCAST_MOTION_WINDOW_MS = 300;
 const SCREENCAST_MOTION_QUALITY = 50;
 const HOST_RECONNECT_DELAY = "1 second";
-/** How long a new tab waits for the desktop app to mount it before running headless. */
+/** How long a new tab waits for the desktop app to mount it before returning a retryable error. */
 const DESKTOP_ATTACH_TIMEOUT = "10 seconds";
 const VIEWER_OUTPUT_LIMIT = 64;
 const RECORDING_SCREENCAST = { format: "jpeg", quality: 90, everyNthFrame: 1 } as const;
@@ -142,6 +142,16 @@ const isHostSetupError = Schema.is(
     PreviewBrowserHost.PreviewBrowserLibrariesError,
   ]),
 );
+
+class ServerBrowserDesktopAttachError extends ServerBrowserPage.ServerBrowserOperationError {
+  readonly _tag = "ServerBrowserDesktopAttachError";
+  constructor() {
+    super(
+      "PreviewAutomationExecutionError",
+      "The in-app browser tab has not attached yet. Retry using its tabId from preview_status; no separate browser was opened.",
+    );
+  }
+}
 
 export class ServerBrowserLaunchError extends Schema.TaggedError<ServerBrowserLaunchError>()(
   "ServerBrowserLaunchError",
@@ -709,15 +719,17 @@ const make = Effect.gen(function* () {
    * With a desktop app attached, every tab of this server renders there, so a
    * new tab waits for its `<webview>` instead of launching headless.
    */
-  const desktopRenders = (snapshot: PreviewSessionSnapshot) =>
-    desktopChannel.available
-      ? Effect.runPromise(
-          desktopChannel.awaitAttached(
-            { threadId: snapshot.threadId, tabId: snapshot.tabId },
-            DESKTOP_ATTACH_TIMEOUT,
-          ),
-        )
-      : Promise.resolve(false);
+  const desktopRenders = async (snapshot: PreviewSessionSnapshot) => {
+    if (!desktopChannel.available) return false;
+    const attached = await Effect.runPromise(
+      desktopChannel.awaitAttached(
+        { threadId: snapshot.threadId, tabId: snapshot.tabId },
+        DESKTOP_ATTACH_TIMEOUT,
+      ),
+    );
+    if (!attached) throw new ServerBrowserDesktopAttachError();
+    return true;
+  };
 
   /** Connects to the desktop's page for a tab, which it renders and the server drives. */
   const connectDesktop = async (snapshot: PreviewSessionSnapshot) => {
@@ -1220,6 +1232,17 @@ const make = Effect.gen(function* () {
       });
     });
 
+  // Viewers use a launch-error wrapper; automation keeps the native retry guidance.
+  const findAutomationTab = (threadId: string, tabId: string) =>
+    findTab(threadId, tabId).pipe(
+      Effect.mapError((error) =>
+        error instanceof ServerBrowserLaunchError &&
+        error.cause instanceof ServerBrowserDesktopAttachError
+          ? error.cause
+          : error,
+      ),
+    );
+
   const atTabLimit = (agentSessionId: string) =>
     tabs.size + pendingTabs.size >= SERVER_TAB_LIMIT ||
     [...tabs.values()].filter((tab) => tab.control.agentId === agentSessionId).length >=
@@ -1315,15 +1338,45 @@ const make = Effect.gen(function* () {
   const statusWithTitle = async (
     tab: ServerTab | undefined,
     agentSessionId?: string,
+    threadId: string | undefined = tab?.threadId,
+    requestedTabId?: string,
   ): Promise<PreviewAutomationStatus> => {
+    const { sessions } = threadId
+      ? await Effect.runPromise(manager.list({ threadId: ThreadId.make(threadId) }))
+      : { sessions: [] };
+    const sessionTabs = sessions.filter((session) => session.runtime === "server");
+    const listedTabs = sessionTabs.map((session) => {
+      const live = tabs.get(tabKey(session.threadId, session.tabId));
+      const url = live?.page.url() ?? ("url" in session.navStatus ? session.navStatus.url : null);
+      return {
+        tabId: session.tabId,
+        url: url === "about:blank" ? null : url,
+        ...(live?.openerTabId === undefined ? {} : { openerTabId: live.openerTabId }),
+        owner: live
+          ? tabOwner(live)
+          : session.automationOwner
+            ? ("agent" as const)
+            : ("unclaimed" as const),
+        ownedByCaller: live
+          ? live.control.agentId === agentSessionId
+          : session.automationOwner !== undefined && session.automationOwner === agentSessionId,
+        visible: (live?.viewers.size ?? 0) > 0,
+        ...(session.profileId === undefined ? {} : { profileId: session.profileId }),
+      };
+    });
     if (!tab) {
+      const pending = requestedTabId
+        ? sessionTabs.find((session) => session.tabId === requestedTabId)
+        : (sessionTabs.findLast((session) => session.automationOwner === agentSessionId) ??
+          sessionTabs.at(-1));
       return {
         available: false,
         visible: false,
-        tabId: null,
-        url: null,
-        title: null,
-        loading: false,
+        tabId: pending?.tabId ?? null,
+        url: pending && "url" in pending.navStatus ? pending.navStatus.url : null,
+        title: pending && "title" in pending.navStatus ? pending.navStatus.title || null : null,
+        loading: pending?.navStatus._tag === "Loading",
+        tabs: listedTabs,
         ...profileStatus(),
       };
     }
@@ -1347,17 +1400,7 @@ const make = Effect.gen(function* () {
         : null,
       viewportSetting: tab.setting,
       ...(viewport ? { viewport } : {}),
-      tabs: [...tabs.values()]
-        .filter((candidate) => candidate.threadId === tab.threadId)
-        .map((candidate) => ({
-          tabId: candidate.tabId,
-          url: candidate.page.url() === "about:blank" ? null : candidate.page.url(),
-          ...(candidate.openerTabId === undefined ? {} : { openerTabId: candidate.openerTabId }),
-          owner: tabOwner(candidate),
-          ownedByCaller: candidate.control.agentId === agentSessionId,
-          visible: candidate.viewers.size > 0,
-          ...(candidate.profileId === undefined ? {} : { profileId: candidate.profileId }),
-        })),
+      tabs: listedTabs,
       ...profileStatus(),
       downloads: tab.downloads.map(({ fileName, path, sizeBytes, url, completedAt }) => ({
         fileName,
@@ -1652,7 +1695,13 @@ const make = Effect.gen(function* () {
       request.tabId === undefined
         ? latestThreadTab(request.threadId, request.agentSessionId)
         : await Effect.runPromise(
-            findTab(request.threadId, request.tabId).pipe(Effect.orElseSucceed(constVoid)),
+            findAutomationTab(request.threadId, request.tabId).pipe(
+              Effect.catch((error) =>
+                error instanceof ServerBrowserDesktopAttachError
+                  ? Effect.fail(error)
+                  : Effect.succeed(undefined),
+              ),
+            ),
           );
     if (!tab) {
       throw new ServerBrowserPage.ServerBrowserOperationError(
@@ -1693,6 +1742,8 @@ const make = Effect.gen(function* () {
             ? latestThreadTab(request.threadId, request.agentSessionId)
             : tabs.get(tabKey(request.threadId, request.tabId)),
           request.agentSessionId,
+          request.threadId,
+          request.tabId,
         );
       case "open": {
         if (!request.agentSessionId)
@@ -1718,7 +1769,7 @@ const make = Effect.gen(function* () {
         const found =
           reuse && request.tabId !== undefined
             ? await Effect.runPromise(
-                findTab(request.threadId, request.tabId).pipe(
+                findAutomationTab(request.threadId, request.tabId).pipe(
                   Effect.catchTags({
                     ServerBrowserTabNotFoundError: () => Effect.succeed(undefined),
                   }),
@@ -1817,6 +1868,27 @@ const make = Effect.gen(function* () {
           );
         }
         return tab.control.agent(request.agentSessionId ?? "", () => stopRecording(tab));
+      }
+    }
+    // A timed-out native open still has a session its owner can close without
+    // first attaching to its page. An attachment racing this read uses normal control checks.
+    if (request.operation === "close" && request.tabId !== undefined && request.agentSessionId) {
+      const key = tabKey(request.threadId, request.tabId);
+      if (!tabs.has(key)) {
+        const { sessions } = await Effect.runPromise(manager.list({ threadId: request.threadId }));
+        const unopened = sessions.find((session) => session.tabId === request.tabId);
+        if (unopened && !tabs.has(key)) {
+          if (unopened.automationOwner !== request.agentSessionId)
+            throw new BrowserControlInterrupted(
+              "Only the agent session that opened this tab can close it.",
+              "agentMismatch",
+            );
+          if (pendingTabs.has(key)) closedPendingTabs.add(key);
+          await Effect.runPromise(
+            manager.close({ threadId: request.threadId, tabId: unopened.tabId }),
+          );
+          return {};
+        }
       }
     }
     const tab = await requireTab(request);

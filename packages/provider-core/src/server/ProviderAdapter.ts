@@ -383,6 +383,38 @@ export class ProviderAdapterMcpAuthVersionError extends Schema.TaggedError<Provi
   }
 }
 
+export class ProviderAdapterMcpAuthError extends Schema.TaggedError<ProviderAdapterMcpAuthError>()(
+  "ProviderAdapterMcpAuthError",
+  {
+    driver: ProviderDriverKind,
+    reason: Schema.Literals([
+      "login-failed",
+      "login-expired",
+      "login-not-found",
+      "login-pending",
+      "status-check-failed",
+    ]),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return {
+      "login-failed": "MCP authorization failed. Start a new login and try again.",
+      "login-expired": "MCP authorization expired. Start a new login and try again.",
+      "login-not-found":
+        "No pending MCP login matches this thread, server, and login id. Start a new login.",
+      "login-pending":
+        "An MCP login is already pending for this thread and server. Wait for it to finish.",
+      "status-check-failed":
+        "MCP authorization completed, but the server connection could not be checked. Check the server status before starting another login.",
+    }[this.reason];
+  }
+
+  get detail(): string {
+    return this.message;
+  }
+}
+
 export const ProviderAdapterV2Error = Schema.Union([
   ProviderAdapterCapabilitiesError,
   ProviderAdapterOpenSessionError,
@@ -400,6 +432,7 @@ export const ProviderAdapterV2Error = Schema.Union([
   ProviderAdapterEventStreamError,
   ProviderAdapterProtocolError,
   ProviderAdapterMcpAuthVersionError,
+  ProviderAdapterMcpAuthError,
 ]);
 export type ProviderAdapterV2Error = typeof ProviderAdapterV2Error.Type;
 

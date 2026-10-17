@@ -159,13 +159,54 @@ describe("Codex MCP OAuth", () => {
       const failure = yield* auth
         .waitForLogin({ ...serverInput, loginId: "owned" })
         .pipe(Effect.flip);
-      assert.equal(failure._tag, "ProviderAdapterProtocolError");
-      assert.equal(failure.detail, "Codex MCP OAuth login failed");
+      assert.containsSubset(failure, {
+        _tag: "ProviderAdapterMcpAuthError",
+        reason: "login-failed",
+      });
       assert.isFalse(yield* auth.hasPendingLogin());
     }).pipe(
       Effect.provide(
         CodexReplay.layerReplay(
           transcript([loginRequest(1), completion("owned", false), loginResponse(1, "owned")]),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("reports status failure after completed OAuth without requesting another login", () =>
+    Effect.gen(function* () {
+      const auth = yield* CodexMcpAuth.make;
+      yield* auth.login(serverInput);
+      const failure = yield* auth
+        .waitForLogin({ ...serverInput, loginId: "owned" })
+        .pipe(Effect.flip);
+      assert.containsSubset(failure, {
+        _tag: "ProviderAdapterMcpAuthError",
+        reason: "status-check-failed",
+        cause: { _tag: "ProviderAdapterProtocolError" },
+      });
+      assert.notInclude(failure.message, "unsafe-provider-error");
+      assert.isFalse(yield* auth.hasPendingLogin());
+      const standaloneFailure = yield* auth.status(serverInput).pipe(Effect.flip);
+      assert.equal(standaloneFailure._tag, "ProviderAdapterProtocolError");
+    }).pipe(
+      Effect.provide(
+        CodexReplay.layerReplay(
+          transcript([
+            loginRequest(1),
+            completion("owned", true),
+            loginResponse(1, "owned"),
+            ...statusExchange(2, "connected").slice(0, 1),
+            {
+              type: "emit_inbound",
+              frame: { id: 2, error: { code: -32000, message: "unsafe-provider-error" } },
+            },
+            ...statusExchange(3, "connected").slice(0, 1),
+            {
+              type: "emit_inbound",
+              frame: { id: 3, error: { code: -32000, message: "unsafe-provider-error" } },
+            },
+          ]),
         ),
       ),
     ),
@@ -218,7 +259,10 @@ describe("Codex MCP OAuth", () => {
         const auth = yield* CodexMcpAuth.make;
         yield* auth.login(serverInput);
         const overlapping = yield* auth.login(serverInput).pipe(Effect.flip);
-        assert.equal(overlapping._tag, "ProviderAdapterProtocolError");
+        assert.containsSubset(overlapping, {
+          _tag: "ProviderAdapterMcpAuthError",
+          reason: "login-pending",
+        });
         const wrongThread = yield* auth
           .waitForLogin({ ...serverInput, threadId: "other-thread", loginId: "old" })
           .pipe(Effect.flip);
@@ -228,21 +272,33 @@ describe("Codex MCP OAuth", () => {
         const wrongLogin = yield* auth
           .waitForLogin({ ...serverInput, loginId: "foreign" })
           .pipe(Effect.flip);
-        assert.equal(wrongThread._tag, "ProviderAdapterProtocolError");
-        assert.equal(wrongServer._tag, "ProviderAdapterProtocolError");
-        assert.equal(wrongLogin._tag, "ProviderAdapterProtocolError");
+        assert.containsSubset(wrongThread, {
+          _tag: "ProviderAdapterMcpAuthError",
+          reason: "login-not-found",
+        });
+        assert.containsSubset(wrongServer, {
+          _tag: "ProviderAdapterMcpAuthError",
+          reason: "login-not-found",
+        });
+        assert.containsSubset(wrongLogin, {
+          _tag: "ProviderAdapterMcpAuthError",
+          reason: "login-not-found",
+        });
         assert.isTrue(yield* auth.hasPendingLogin());
         yield* TestClock.adjust("301 seconds");
         assert.isFalse(yield* auth.hasPendingLogin());
         const expired = yield* auth
           .waitForLogin({ ...serverInput, loginId: "old" })
           .pipe(Effect.flip);
-        assert.equal(expired._tag, "ProviderAdapterProtocolError");
+        assert.containsSubset(expired, {
+          _tag: "ProviderAdapterMcpAuthError",
+          reason: "login-not-found",
+        });
         yield* auth.login(serverInput);
         const result = yield* auth
           .waitForLogin({ ...serverInput, loginId: "new" })
           .pipe(Effect.flip);
-        assert.equal(result.detail, "Codex MCP OAuth login failed");
+        assert.equal(result.reason, "login-failed");
         assert.isFalse(yield* auth.hasPendingLogin());
       }).pipe(
         Effect.provide(
@@ -319,7 +375,10 @@ describe("Codex MCP OAuth", () => {
         yield* Fiber.interrupt(waiter);
         assert.isTrue(yield* auth.hasPendingLogin());
         const overlapping = yield* auth.login(serverInput).pipe(Effect.flip);
-        assert.equal(overlapping._tag, "ProviderAdapterProtocolError");
+        assert.containsSubset(overlapping, {
+          _tag: "ProviderAdapterMcpAuthError",
+          reason: "login-pending",
+        });
         yield* Deferred.succeed(release, undefined);
         const server = yield* auth.waitForLogin({ ...serverInput, loginId: "owned" });
         assert.equal(server.status, "connected");
@@ -337,11 +396,34 @@ describe("Codex MCP OAuth", () => {
         .pipe(Effect.forkChild({ startImmediately: true }));
       yield* TestClock.adjust("300 seconds");
       const failure = yield* Fiber.join(waiter).pipe(Effect.flip);
-      assert.equal(failure.detail, "Codex MCP OAuth login expired");
+      assert.equal(failure.reason, "login-expired");
       assert.isFalse(yield* auth.hasPendingLogin());
     }).pipe(
       Effect.provide(
         CodexReplay.layerReplay(transcript([loginRequest(1), loginResponse(1, "owned")])),
+      ),
+    ),
+  );
+
+  it.effect("reports expiration when a known login is first awaited at its deadline", () =>
+    Effect.gen(function* () {
+      const auth = yield* CodexMcpAuth.make;
+      yield* auth.login(serverInput);
+      yield* TestClock.adjust("300 seconds");
+      const expired = yield* auth
+        .waitForLogin({ ...serverInput, loginId: "owned" })
+        .pipe(Effect.flip);
+      assert.equal(expired.reason, "login-expired");
+      assert.isFalse(yield* auth.hasPendingLogin());
+      const pruned = yield* auth
+        .waitForLogin({ ...serverInput, loginId: "owned" })
+        .pipe(Effect.flip);
+      assert.equal(pruned.reason, "login-not-found");
+    }).pipe(
+      Effect.provide(
+        CodexReplay.layerReplay(
+          transcript([loginRequest(1), completion("owned", true), loginResponse(1, "owned")]),
+        ),
       ),
     ),
   );

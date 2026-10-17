@@ -10,7 +10,11 @@ import {
   ThreadMcpServerStatus,
 } from "@t3tools/contracts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
-import { ProviderAdapterMcpAuthVersionError } from "@t3tools/provider-core/server/ProviderAdapter";
+import {
+  ProviderAdapterMcpAuthError,
+  ProviderAdapterMcpAuthVersionError,
+  ProviderAdapterProtocolError,
+} from "@t3tools/provider-core/server/ProviderAdapter";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -219,6 +223,85 @@ it.effect("preserves a safe update instruction for unsupported native OAuth vers
     ),
   ),
 );
+
+it.effect("keeps a failed status request distinct from completed sign-in", () => {
+  const nativeError = new ProviderAdapterProtocolError({
+    driver: providerThread.driver,
+    detail: "private provider response with token=secret",
+  });
+  return Effect.gen(function* () {
+    const servers = yield* ThreadMcpServers.ThreadMcpServers;
+    const error = yield* servers.status(target).pipe(Effect.flip);
+    assert.strictEqual(error.reason, "request-failed");
+    assert.strictEqual(error.cause, nativeError);
+    assert.notInclude(error.message, "Sign-in completion");
+    assert.notInclude(error.message, "secret");
+  }).pipe(
+    Effect.provide(
+      testLayer({
+        session: Effect.succeed(
+          Option.some(
+            runtime({
+              status: () => Effect.fail(nativeError),
+              login: () => Effect.die("unexpected native login"),
+              waitForLogin: () => Effect.die("unexpected native wait"),
+            }),
+          ),
+        ),
+      }),
+    ),
+  );
+});
+
+it.effect.each([
+  { reason: "login-failed", instruction: "Start sign-in again" },
+  { reason: "login-expired", instruction: "Start a new sign-in attempt" },
+  { reason: "login-not-found", instruction: "start sign-in again" },
+  { reason: "login-pending", instruction: "existing attempt" },
+  { reason: "status-check-failed", instruction: "Check the server's status" },
+] as const)("preserves a safe recovery instruction for $reason", ({ reason, instruction }) => {
+  const nativeError = new ProviderAdapterMcpAuthError({
+    driver: providerThread.driver,
+    reason,
+    cause: new Error("private provider response with token=secret"),
+  });
+  return Effect.gen(function* () {
+    const servers = yield* ThreadMcpServers.ThreadMcpServers;
+    const error =
+      reason === "login-pending"
+        ? yield* servers.login(target).pipe(Effect.flip)
+        : yield* servers
+            .waitForLogin({
+              ...target,
+              loginId: loginStarted.loginId,
+              providerThreadId: providerThread.id,
+            })
+            .pipe(Effect.flip);
+    assert.strictEqual(error.reason, reason);
+    assert.strictEqual(error.cause, nativeError);
+    assert.include(error.message, instruction);
+    assert.notInclude(error.message, "secret");
+    if (reason === "status-check-failed") {
+      assert.include(error.message, "OAuth sign-in completed");
+    } else {
+      assert.notInclude(error.message, "completed");
+    }
+  }).pipe(
+    Effect.provide(
+      testLayer({
+        session: Effect.succeed(
+          Option.some(
+            runtime({
+              status: () => Effect.die("unexpected native status"),
+              login: () => Effect.fail(nativeError),
+              waitForLogin: () => Effect.fail(nativeError),
+            }),
+          ),
+        ),
+      }),
+    ),
+  );
+});
 
 it.effect("rejects an old provider thread before touching its native OAuth attempt", () =>
   Effect.gen(function* () {

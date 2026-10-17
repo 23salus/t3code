@@ -21,6 +21,11 @@ export class ThreadMcpError extends Schema.TaggedError<ThreadMcpError>()("Thread
     "provider-unsupported",
     "provider-version-unsupported",
     "session-changed",
+    "login-failed",
+    "login-expired",
+    "login-not-found",
+    "login-pending",
+    "status-check-failed",
     "request-failed",
   ]),
   cause: Schema.optional(Schema.Defect()),
@@ -35,8 +40,18 @@ export class ThreadMcpError extends Schema.TaggedError<ThreadMcpError>()("Thread
         return "Update this chat's provider to a version supporting correlated MCP OAuth sign-in, restart the agent session, and start sign-in again.";
       case "session-changed":
         return "The chat's provider session changed. Start MCP sign-in again in the current session.";
+      case "login-failed":
+        return "MCP sign-in did not complete successfully. Start sign-in again to retry.";
+      case "login-expired":
+        return "The MCP sign-in attempt expired. Start a new sign-in attempt.";
+      case "login-not-found":
+        return "No pending MCP sign-in matches this session, server, and login ID. The attempt may have expired; start sign-in again.";
+      case "login-pending":
+        return "MCP sign-in is already pending for this session and server. Finish or wait for the existing attempt before starting again.";
+      case "status-check-failed":
+        return "OAuth sign-in completed, but the MCP server status could not be verified. Check the server's status before using its tools.";
       case "request-failed":
-        return "The native MCP request failed. Sign-in completion does not confirm that the server is connected.";
+        return "The native MCP request failed. Check the server's status and try again.";
     }
   }
 }
@@ -133,7 +148,9 @@ const make = Effect.gen(function* () {
               reason:
                 cause._tag === "ProviderAdapterMcpAuthVersionError"
                   ? "provider-version-unsupported"
-                  : "request-failed",
+                  : cause._tag === "ProviderAdapterMcpAuthError"
+                    ? cause.reason
+                    : "request-failed",
               cause,
             }),
         ),
@@ -160,7 +177,12 @@ const make = Effect.gen(function* () {
       .pipe(
         Effect.mapError(
           (cause) =>
-            new ThreadMcpError({ threadId: input.threadId, reason: "request-failed", cause }),
+            new ThreadMcpError({
+              threadId: input.threadId,
+              reason:
+                cause._tag === "ProviderAdapterMcpAuthError" ? cause.reason : "request-failed",
+              cause,
+            }),
         ),
       );
     const current = yield* resolve(input);

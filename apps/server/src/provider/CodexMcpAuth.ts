@@ -1,5 +1,6 @@
 import { ProviderDriverKind, type ThreadMcpServerStatus } from "@t3tools/contracts";
 import {
+  ProviderAdapterMcpAuthError,
   ProviderAdapterMcpAuthVersionError,
   ProviderAdapterProtocolError,
 } from "@t3tools/provider-core/server/ProviderAdapter";
@@ -32,7 +33,7 @@ interface ServerInput {
 interface PendingLogin extends ServerInput {
   readonly loginId: string | null;
   readonly expiresAt: number;
-  readonly completion: Deferred.Deferred<boolean, ProviderAdapterProtocolError>;
+  readonly completion: Deferred.Deferred<boolean, ProviderAdapterMcpAuthError>;
   readonly earlyCompletions: ReadonlyMap<string, boolean>;
 }
 
@@ -48,9 +49,9 @@ export const make = Effect.gen(function* () {
       pending.delete(entry[0]);
       yield* Deferred.fail(
         entry[1].completion,
-        new ProviderAdapterProtocolError({
+        new ProviderAdapterMcpAuthError({
           driver: CODEX_DRIVER_KIND,
-          detail: "Codex MCP OAuth login expired",
+          reason: "login-expired",
         }),
       );
     }
@@ -111,12 +112,12 @@ export const make = Effect.gen(function* () {
   const login = Effect.fn("CodexMcpAuth.login")(function* (input: ServerInput) {
     yield* expire;
     const key = loginKey(input);
-    const completion = yield* Deferred.make<boolean, ProviderAdapterProtocolError>();
+    const completion = yield* Deferred.make<boolean, ProviderAdapterMcpAuthError>();
     const expiresAt = (yield* Clock.currentTimeMillis) + LOGIN_TIMEOUT_SECS * 1_000;
     if (pending.has(key)) {
-      return yield* new ProviderAdapterProtocolError({
+      return yield* new ProviderAdapterMcpAuthError({
         driver: CODEX_DRIVER_KIND,
-        detail: "A Codex MCP OAuth login is already pending for this thread and server",
+        reason: "login-pending",
       });
     }
     pending.set(key, {
@@ -157,9 +158,9 @@ export const make = Effect.gen(function* () {
       }
       const entry = pending.get(key);
       if (entry?.completion !== completion) {
-        return yield* new ProviderAdapterProtocolError({
+        return yield* new ProviderAdapterMcpAuthError({
           driver: CODEX_DRIVER_KIND,
-          detail: "Codex MCP OAuth login expired",
+          reason: "login-expired",
         });
       }
       pending.set(key, { ...entry, loginId: response.loginId, earlyCompletions: new Map() });
@@ -172,35 +173,50 @@ export const make = Effect.gen(function* () {
   const waitForLogin = Effect.fn("CodexMcpAuth.waitForLogin")(function* (
     input: ServerInput & { readonly loginId: string },
   ) {
-    yield* expire;
     const key = loginKey(input);
     const entry = pending.get(key);
+    yield* expire;
     if (!entry || entry.loginId !== input.loginId) {
-      return yield* new ProviderAdapterProtocolError({
+      return yield* new ProviderAdapterMcpAuthError({
         driver: CODEX_DRIVER_KIND,
-        detail: "No owned Codex MCP OAuth login matches this thread, server, and login id",
+        reason: "login-not-found",
       });
     }
     const now = yield* Clock.currentTimeMillis;
     return yield* Effect.gen(function* () {
+      if (entry.expiresAt <= now) {
+        return yield* new ProviderAdapterMcpAuthError({
+          driver: CODEX_DRIVER_KIND,
+          reason: "login-expired",
+        });
+      }
       const success = yield* Deferred.await(entry.completion).pipe(
         Effect.timeoutOrElse({
           duration: Duration.millis(Math.max(0, entry.expiresAt - now)),
           orElse: () =>
             Effect.fail(
-              new ProviderAdapterProtocolError({
+              new ProviderAdapterMcpAuthError({
                 driver: CODEX_DRIVER_KIND,
-                detail: "Codex MCP OAuth login expired",
+                reason: "login-expired",
               }),
             ),
         }),
       );
       if (!success)
-        return yield* new ProviderAdapterProtocolError({
+        return yield* new ProviderAdapterMcpAuthError({
           driver: CODEX_DRIVER_KIND,
-          detail: "Codex MCP OAuth login failed",
+          reason: "login-failed",
         });
-      return yield* status(input);
+      return yield* status(input).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProviderAdapterMcpAuthError({
+              driver: CODEX_DRIVER_KIND,
+              reason: "status-check-failed",
+              cause,
+            }),
+        ),
+      );
     }).pipe(
       Effect.onExit((exit) =>
         Effect.sync(() => {

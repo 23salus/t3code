@@ -32,6 +32,8 @@ import {
   RunAttemptId,
   RunId,
   ThreadId,
+  ThreadMcpLoginStarted,
+  ThreadMcpServerStatus,
   TurnItemId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -368,6 +370,19 @@ export class ProviderAdapterProtocolError extends Schema.TaggedError<ProviderAda
   }
 }
 
+export class ProviderAdapterMcpAuthVersionError extends Schema.TaggedError<ProviderAdapterMcpAuthVersionError>()(
+  "ProviderAdapterMcpAuthVersionError",
+  { driver: ProviderDriverKind },
+) {
+  override get message(): string {
+    return "Update the provider to a version that supports correlated MCP OAuth login.";
+  }
+
+  get detail(): string {
+    return this.message;
+  }
+}
+
 export const ProviderAdapterV2Error = Schema.Union([
   ProviderAdapterCapabilitiesError,
   ProviderAdapterOpenSessionError,
@@ -384,6 +399,7 @@ export const ProviderAdapterV2Error = Schema.Union([
   ProviderAdapterRuntimeRequestResponseError,
   ProviderAdapterEventStreamError,
   ProviderAdapterProtocolError,
+  ProviderAdapterMcpAuthVersionError,
 ]);
 export type ProviderAdapterV2Error = typeof ProviderAdapterV2Error.Type;
 
@@ -526,6 +542,22 @@ export interface ProviderAdapterV2McpApps {
   }) => Effect.Effect<{ readonly contents: ReadonlyArray<unknown> }, ProviderAdapterV2Error>;
 }
 
+export interface ProviderAdapterV2McpServers {
+  readonly status: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+    readonly server: string;
+  }) => Effect.Effect<ThreadMcpServerStatus, ProviderAdapterV2Error>;
+  readonly login: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+    readonly server: string;
+  }) => Effect.Effect<ThreadMcpLoginStarted, ProviderAdapterV2Error>;
+  readonly waitForLogin: (input: {
+    readonly providerThread: OrchestrationV2ProviderThread;
+    readonly server: string;
+    readonly loginId: string;
+  }) => Effect.Effect<ThreadMcpServerStatus, ProviderAdapterV2Error>;
+}
+
 export type ProviderAdapterV2SubagentOutcome = {
   readonly status: "completed" | "failed" | "cancelled";
   readonly completedAt: NonNullable<OrchestrationV2Subagent["completedAt"]>;
@@ -620,6 +652,7 @@ export interface ProviderAdapterV2SessionRuntime {
    * calls stay plain tool rows.
    */
   readonly mcpApps?: ProviderAdapterV2McpApps;
+  readonly mcpServers?: ProviderAdapterV2McpServers;
   readonly rollbackThread: (
     input: ProviderAdapterV2RollbackThreadInput,
   ) => Effect.Effect<ProviderAdapterV2ThreadSnapshot, ProviderAdapterV2Error>;
